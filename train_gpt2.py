@@ -250,6 +250,50 @@ class DataLoaderLite:
             self.tokens = load_tokens(self.shards[self.current_shard])
             self.current_position = B * T * self.process_rank
         return x, y
+    
+class JournalDataLoader: 
+    def __init__(self, filepath, batch_size, block_size, device="cpu"):
+        self.B = batch_size
+        self.T = block_size
+        self.device = device
+    
+        self.enc = tiktoken.get_encoding("gpt2")
+        
+        with open(file=filepath, mode="r", encoding="utf-8") as f: 
+            text = f.read()
+        
+        print(f"Loading {filepath}...")
+        print(f"Total characters: {len(text)}")
+        
+        # Tokenize the text
+        self.tokens = torch.tensor(self.enc.encode(text), dtype=torch.long)
+        print(f"Total tokens: {len(self.tokens)}")
+        
+        self.n_tokens = len(self.tokens)
+        self.reset()
+        
+    def reset(self):
+        self.current_pos = 0
+    
+    def next_batch(self):
+        # Get a batch of random chunks
+        x = torch.stack([self.get_chunk() for _ in range(self.B)])
+        y = torch.stack([self.get_chunk(offset=1) for _ in range(self.B)])
+        return x.to(self.device), y.to(self.device)
+    
+    def get_chunk(self, offset=0):
+        # Get a random chunk
+        # We need to subtract block_size to ensure there's room for both the input and target
+        start_idx = torch.randint(0, self.n_tokens - self.T - 1, (1,)).item()
+        # For input (when offset=0), take block_size tokens
+        # For target (when offset=1), take the next block_size tokens
+        chunk = self.tokens[start_idx + offset : start_idx + offset + self.T]
+        if len(chunk) != self.T:
+            # If we somehow got a wrong size (shouldn't happen with corrected indexing)
+            raise ValueError(f"Chunk size {len(chunk)} doesn't match block size {self.T}")
+        return chunk
+            
+            
 
 # -----------------------------------------------------------------------------
 # helper function for HellaSwag eval
@@ -321,22 +365,29 @@ if torch.cuda.is_available():
 
 enc = tiktoken.get_encoding("gpt2")
 
-total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
-B = 64 # micro batch size
-T = 1024 # sequence length
+total_batch_size = 4096 # 2**19, ~0.5M, in number of tokens
+B = 16 # micro batch size
+T = 256 # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
 if master_process:
     print(f"total desired batch size: {total_batch_size}")
     print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
-train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
-val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
-
+#train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
+#val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
+train_loader = JournalDataLoader(filepath="journals.txt", batch_size=B, block_size=T, device=device)
 torch.set_float32_matmul_precision('high')
 
 # create model
-model = GPT(GPTConfig(vocab_size=50304))
+model = GPT(
+    GPTConfig(block_size=256, 
+              vocab_size=50304,
+              n_layer=8,
+              n_head=8, 
+              n_embd=512
+            )
+)
 # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
 model.to(device)
 use_compile = False # torch.compile interferes with HellaSwag eval and Generation. TODO fix
@@ -348,8 +399,8 @@ raw_model = model.module if ddp else model # always contains the "raw" unwrapped
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 715
-max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+warmup_steps = 100
+max_steps = 5000 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
     if it < warmup_steps:
@@ -377,78 +428,47 @@ for step in range(max_steps):
     t0 = time.time()
     last_step = (step == max_steps - 1)
 
-    # once in a while evaluate our validation loss
-    if step % 250 == 0 or last_step:
-        model.eval()
-        val_loader.reset()
-        with torch.no_grad():
-            val_loss_accum = 0.0
-            val_loss_steps = 20
-            for _ in range(val_loss_steps):
-                x, y = val_loader.next_batch()
-                x, y = x.to(device), y.to(device)
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(x, y)
-                loss = loss / val_loss_steps
-                val_loss_accum += loss.detach()
-        if ddp:
-            dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
-        if master_process:
-            print(f"validation loss: {val_loss_accum.item():.4f}")
-            with open(log_file, "a") as f:
-                f.write(f"{step} val {val_loss_accum.item():.4f}\n")
-            if step > 0 and (step % 5000 == 0 or last_step):
-                # optionally write model checkpoints
-                checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
-                checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'config': raw_model.config,
-                    'step': step,
-                    'val_loss': val_loss_accum.item()
-                }
-                # you might also want to add optimizer.state_dict() and
-                # rng seeds etc., if you wanted to more exactly resume training
-                torch.save(checkpoint, checkpoint_path)
+
 
     # once in a while evaluate hellaswag
-    if (step % 250 == 0 or last_step) and (not use_compile):
-        num_correct_norm = 0
-        num_total = 0
-        for i, example in enumerate(iterate_examples("val")):
-            # only process examples where i % ddp_world_size == ddp_rank
-            if i % ddp_world_size != ddp_rank:
-                continue
-            # render the example into tokens and labels
-            _, tokens, mask, label = render_example(example)
-            tokens = tokens.to(device)
-            mask = mask.to(device)
-            # get the logits
-            with torch.no_grad():
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(tokens)
-                pred_norm = get_most_likely_row(tokens, mask, logits)
-            num_total += 1
-            num_correct_norm += int(pred_norm == label)
-        # reduce the stats across all processes
-        if ddp:
-            num_total = torch.tensor(num_total, dtype=torch.long, device=device)
-            num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
-            dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
-            dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
-            num_total = num_total.item()
-            num_correct_norm = num_correct_norm.item()
-        acc_norm = num_correct_norm / num_total
-        if master_process:
-            print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
-            with open(log_file, "a") as f:
-                f.write(f"{step} hella {acc_norm:.4f}\n")
+    # if (step % 250 == 0 or last_step) and (not use_compile):
+    #     num_correct_norm = 0
+    #     num_total = 0
+    #     for i, example in enumerate(iterate_examples("val")):
+    #         # only process examples where i % ddp_world_size == ddp_rank
+    #         if i % ddp_world_size != ddp_rank:
+    #             continue
+    #         # render the example into tokens and labels
+    #         _, tokens, mask, label = render_example(example)
+    #         tokens = tokens.to(device)
+    #         mask = mask.to(device)
+    #         # get the logits
+    #         with torch.no_grad():
+    #             with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+    #                 logits, loss = model(tokens)
+    #             pred_norm = get_most_likely_row(tokens, mask, logits)
+    #         num_total += 1
+    #         num_correct_norm += int(pred_norm == label)
+    #     # reduce the stats across all processes
+    #     if ddp:
+    #         num_total = torch.tensor(num_total, dtype=torch.long, device=device)
+    #         num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
+    #         dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
+    #         dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
+    #         num_total = num_total.item()
+    #         num_correct_norm = num_correct_norm.item()
+    #     acc_norm = num_correct_norm / num_total
+    #     if master_process:
+    #         print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
+    #         with open(log_file, "a") as f:
+    #             f.write(f"{step} hella {acc_norm:.4f}\n")
 
     # once in a while generate from the model (except step 0, which is noise)
     if ((step > 0 and step % 250 == 0) or last_step) and (not use_compile):
         model.eval()
         num_return_sequences = 4
         max_length = 32
-        tokens = enc.encode("Hello, I'm a language model,")
+        tokens = enc.encode("## August ")
         tokens = torch.tensor(tokens, dtype=torch.long)
         tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
         xgen = tokens.to(device)
