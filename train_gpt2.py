@@ -417,9 +417,9 @@ def training():
 
     enc = tiktoken.get_encoding("gpt2")
 
-    total_batch_size = 16384 # 2**19, ~0.5M, in number of tokens
+    total_batch_size = 4096 # 2**19, ~0.5M, in number of tokens
     print(ddp_world_size)
-    B = 32 # micro batch size
+    B = 8 # micro batch size
     T = 512 # sequence length
     assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
     grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
@@ -433,15 +433,15 @@ def training():
     torch.set_float32_matmul_precision('high')
 
     # create model
-    model = GPT(
-        GPTConfig(block_size=512, 
-                vocab_size=50304,
-                n_layer=12,
-                n_head=12, 
-                n_embd=768
-                )
-    )
-    # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
+    # model = GPT(
+    #     GPTConfig(block_size=512, 
+    #             vocab_size=50304,
+    #             n_layer=12,
+    #             n_head=12, 
+    #             n_embd=768
+    #             )
+    # )
+    model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
     model.to(device)
     use_compile = True# torch.compile interferes with HellaSwag eval and Generation. TODO fix
     if use_compile:
@@ -449,7 +449,7 @@ def training():
 
     raw_model = model # always contains the "raw" unwrapped model
 
-    max_lr = 6e-4 * 3
+    max_lr = 3e-5 * 3
     min_lr = max_lr * 0.1
     warmup_steps = 100
     max_steps = 5000 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
@@ -486,7 +486,7 @@ def training():
         if ((step > 0 and step % 50 == 0) or last_step) :#and (not use_compile):
             model.eval()
             num_return_sequences = 4
-            max_length = 32
+            max_length = 250
             tokens = enc.encode("## August ")
             tokens = torch.tensor(tokens, dtype=torch.long)
             tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
@@ -567,7 +567,7 @@ def inference():
 
 
 def main(): 
-    #training()
+    training()
     inference()
 
 if __name__ == "__main__": 
