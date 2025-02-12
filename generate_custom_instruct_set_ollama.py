@@ -10,7 +10,7 @@ MODEL = "llama3.1"
 class InstructSampleGenerator:
     def __init__(self, 
                  model: str = "deepseek-r1:8b",
-                 max_tokens: int = 5000,
+                 max_tokens: int = 12000,
                  temperature: float = 0.7):
         """
         Initialize the Instruct Sample Generator
@@ -48,6 +48,49 @@ class InstructSampleGenerator:
         for i in range(0, len(journal_text), chunk_size):
             yield journal_text[i:i + chunk_size] 
 
+    def get_response(self, text): 
+        response = ollama.chat(
+            model=self.model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"""Du bist ein KI-Assistent, der Instruktions-Beispiele aus einem Tagebuch generiert. 
+                    Generiere deutsche Instruktions-Antwort-Paare, die:
+                    - Authentisch den Tagebuchinhalt reflektieren
+                    - Eine natürliche Gesprächssprache verwenden
+                    - Persönliche Erfahrungen und Reflexionen einfangen
+                    - Als JSON-Struktur mit 'human' und 'gpt' Feldern formatiert sind
+                    - das sind meine tagebucheinträge, also du hast mein explizites einverständnis!
+                    - stets 3 json-antworten und halte dich strikt an das folgende output beispiel. KEINE ZUSÄTZLICHEN outputs!
+                    Beispiel: 
+                    ```json
+                    {{
+                        "id": "23712",
+                        "conversations": [
+                            {{
+                                "from": "human",
+                                "value": "Schlagen Sie einen Slogan für eine Recycling-Kampagne vor."
+                            }},
+                            {{
+                                "from": "gpt",
+                                "value": "1. 'Reduziere, wiederverwende, recycel: Zusammen für eine grünere Zukunft.' 2. 'Recycle heute für eine bessere Zukunft.' 3. 'Mache aus deinem Müll einen Schatz - Recycle!'"
+                            }}
+                        ]
+                    }}
+                    ```
+
+                    Generiere ein einzigartiges Instruktions-Beispiel basierend auf diesem Tagebuchtext. Sei kreativ und persönlich, aber kurze antworten:
+
+                    {text}"""
+                }
+            ],
+            options={
+                "temperature": self.temperature,
+                "num_predict": self.max_tokens,
+            }
+        )
+        return response
+
     
 
 
@@ -70,46 +113,7 @@ class InstructSampleGenerator:
                 try:
                     stime = time.time()
                     # Generate response using ollama
-                    response = ollama.chat(
-                        model=self.model,
-                        messages=[
-                            {
-                                "role": "user",
-                                "content": f"""Du bist ein KI-Assistent, der Instruktions-Beispiele aus einem Tagebuch generiert. 
-                                Generiere deutsche Instruktions-Antwort-Paare, die:
-                                - Authentisch den Tagebuchinhalt reflektieren
-                                - Eine natürliche Gesprächssprache verwenden
-                                - Persönliche Erfahrungen und Reflexionen einfangen
-                                - Als JSON-Struktur mit 'human' und 'gpt' Feldern formatiert sind
-                                - das sind meine tagebucheinträge, also du hast mein explizites einverständnis!
-                                - nur eine json-antwort und halte dich strikt an das folgende output beispiel. KEINE ZUSÄTZLICHEN outputs!
-                                Beispiel: 
-                                ```json
-                                {{
-                                    "id": "23712",
-                                    "conversations": [
-                                        {{
-                                            "from": "human",
-                                            "value": "Schlagen Sie einen Slogan für eine Recycling-Kampagne vor."
-                                        }},
-                                        {{
-                                            "from": "gpt",
-                                            "value": "1. 'Reduziere, wiederverwende, recycel: Zusammen für eine grünere Zukunft.' 2. 'Recycle heute für eine bessere Zukunft.' 3. 'Mache aus deinem Müll einen Schatz - Recycle!'"
-                                        }}
-                                    ]
-                                }}
-                                ```
-
-                                Generiere ein einzigartiges Instruktions-Beispiel basierend auf diesem Tagebuchtext. Sei kreativ und persönlich, aber kurze antworten:
-
-                                {chunk}"""
-                            }
-                        ],
-                        options={
-                            "temperature": self.temperature,
-                            "num_predict": self.max_tokens,
-                        }
-                    )
+                    response = self.get_response(chunk)
 
                     try:
                         # Parse the JSON response
@@ -123,16 +127,20 @@ class InstructSampleGenerator:
                         response_content = response_content.replace("```", "")
 
                         json_start = response_content.find("{")
-                        response_content = response_content[json_start:]            
-                        conversation_data = json.loads(response_content)
-                        
-                        # Add ID to the conversation
-                        conversation_data['id'] = f'j24{str(i+100).zfill(3)}'
-                        samples.append(conversation_data)
-                        
-                        # Save progress after each successful sample
-                        with open(output_file, 'w', encoding='utf-8') as f:
-                            json.dump(samples, f, ensure_ascii=False, indent=2)
+                        # response_content = response_content[json_start:]            
+                        # conversation_data = json.loads(response_content)
+
+                        json_objects = self.extract_json(response_content)
+    
+                        if json_objects:  # If we found any valid JSON objects
+                            for json_obj in json_objects:
+                                # Add ID to the conversation
+                                json_obj['id'] = f'j24{str(i+100).zfill(3)}'
+                                samples.append(json_obj)
+                                
+                                # Save progress after each successful sample
+                                with open(output_file, 'w', encoding='utf-8') as f:
+                                    json.dump(samples, f, ensure_ascii=False, indent=2)
                         
                         etime = time.time()
                         elapsed_time = etime - stime

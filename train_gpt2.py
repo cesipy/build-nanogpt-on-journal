@@ -7,6 +7,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from hellaswag import render_example, iterate_examples
+
+import json
 # -----------------------------------------------------------------------------
 
 class CausalSelfAttention(nn.Module):
@@ -302,6 +304,77 @@ class JournalDataLoader:
             raise ValueError(f"Chunk size {len(chunk)} doesn't match block size {self.T}")
         return chunk
             
+# -----------------------------------------------------------------------------
+# data loader for instruct dataset
+
+def prepare_instruct_dataset(filepath):
+
+    with open(file=filepath, mode="r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    #enc = tiktoken.get_encoding("gpt2")
+
+    training_texts = []
+    for item in data: 
+        try: 
+            full_text = f"Human: {item['conversations'][0]['value']}.\nAssistant: {item['conversations'][1]['value']}\n"
+            training_texts.append(full_text)
+        except Exception as e: 
+            print(f"Error: {e}")
+            print(f"Item: {item}")
+            continue
+
+    with open("instruct_dataset.txt", "w", encoding="utf-8") as fi:
+        fi.write("\n".join(training_texts))
+
+   
+
+    
+        
+
+
+class InstructLoader:
+    def __init__(self, filepath, batch_size, block_size, device="cpu"): 
+        self.B = batch_size
+        self.T = block_size
+        self.device = device
+
+        self.enc = tiktoken.get_encoding("gpt2")
+
+        prepare_instruct_dataset(filepath=filepath)
+        with open(file="instruct_dataset.txt", mode="r", encoding="utf-8") as f:
+            text = f.read()
+
+        print(f"Loading {filepath}...")
+        print(f"Total characters: {len(text)}")
+
+        self.tokens = torch.tensor(self.enc.encode(text), dtype=torch.long)
+        print(f"Total tokens: {len(self.tokens)}")
+        
+        self.n_tokens = len(self.tokens)
+        self.reset()   
+
+    def reset(self): 
+        self.current_pos = 0
+
+    def next_batch(self): 
+        xs = []
+        ys = []
+
+        for _ in range(self.B): 
+            start_idx = torch.randint(0, self.n_tokens - self.T - 1, (1,)).item()
+            xs.append(self.tokens[start_idx : start_idx + self.T])
+            ys.append(self.tokens[start_idx + 1 : start_idx + self.T + 1])
+
+        x = torch.stack(xs)
+        y = torch.stack(ys)
+        return x.to(self.device), y.to(self.device)
+
+    def get_chunk(self, offset=0): 
+        pass
+
+
+
             
 
 # -----------------------------------------------------------------------------
@@ -429,7 +502,8 @@ def training():
 
     #train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
     #val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
-    train_loader = JournalDataLoader(filepath="journals.txt", batch_size=B, block_size=T, device=device)
+    train_loader = InstructLoader(filepath="res/own-instruct-set.json", batch_size=B, block_size=T, device=device)
+    # train_loader = JournalDataLoader(filepath="journals.txt", batch_size=B, block_size=T, device=device)
     torch.set_float32_matmul_precision('high')
 
     # create model
@@ -441,7 +515,8 @@ def training():
     #             n_embd=768
     #             )
     # )
-    model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
+    model, _ = load_model("model_finetuned_7000.pt", device=device)
+    #model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
     model.to(device)
     use_compile = True# torch.compile interferes with HellaSwag eval and Generation. TODO fix
     if use_compile:
@@ -449,10 +524,10 @@ def training():
 
     raw_model = model # always contains the "raw" unwrapped model
 
-    max_lr = 3e-5 * 3
-    min_lr = max_lr * 0.1
+    max_lr = 3e-5 
+    min_lr = max_lr * 0.05
     warmup_steps = 100
-    max_steps = 5000 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+    max_steps = 15000 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
     def get_lr(it):
         # 1) linear warmup for warmup_iters steps
         if it < warmup_steps:
@@ -487,7 +562,7 @@ def training():
             model.eval()
             num_return_sequences = 4
             max_length = 250
-            tokens = enc.encode("## August ")
+            tokens = enc.encode("Human: wer ist anna? \nAssistant: ")
             tokens = torch.tensor(tokens, dtype=torch.long)
             tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
             xgen = tokens.to(device)
@@ -560,7 +635,7 @@ def inference():
     model, optimizer = load_model("model.pt", device="cuda")
 
     enc = tiktoken.get_encoding("gpt2")
-    prompt = "heute war"
+    prompt = "Human: wer ist anna?.\nAssistant: "
     generate_text(model, prompt, max_tokens=200, num_return_sequences=10, device="cuda")
 
 
@@ -568,7 +643,7 @@ def inference():
 
 def main(): 
     training()
-    inference()
+    #inference()
 
 if __name__ == "__main__": 
     main()
